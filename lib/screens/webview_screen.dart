@@ -13,6 +13,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:smart_auth/smart_auth.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_master_app/config/app_config.dart';
@@ -23,7 +24,6 @@ import 'package:webview_master_app/utils/permission_handler_util.dart';
 import 'package:webview_master_app/utils/prefs_util.dart';
 import 'package:webview_master_app/utils/status_bar_util.dart';
 import 'package:webview_master_app/widgets/exit_dialog.dart';
-import 'package:webview_master_app/widgets/offline_screen.dart';
 import 'package:webview_master_app/screens/splash_screen.dart';
 
 /// WebView Screen - Main screen that loads the configured web URL
@@ -46,12 +46,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
   bool _locationButtonClickDetected = false;
   bool _isInitialLoad = true;
   bool _splashMinDurationElapsed = false;
+  bool _pageLoadFailed = false;
+  Set<String> _cachedUrls = {};
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
 
   // ── Dynamic status bar ────────────────────────────────────────────────────
   // Starts with brand teal; updated automatically by JS colour detection on
   // every page load so the bar always matches the website's top section.
-  Color _statusBarColor = const Color(0xFF087B84);
+  Color _statusBarColor = Colors.white;
   Brightness _statusBarIconBrightness = Brightness.light; // light on teal
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -65,9 +67,41 @@ class _WebViewScreenState extends State<WebViewScreen> {
   @override
   void initState() {
     super.initState();
+    _loadCachedUrls();
     _pullToRefreshController = PullToRefreshController(
       settings: PullToRefreshSettings(color: AppConfig.primaryColor),
       onRefresh: () async {
+        final isConnected = await ConnectivityUtil.isConnected();
+        if (!isConnected) {
+          _pullToRefreshController.endRefreshing();
+          if (mounted) {
+            ScaffoldMessenger.of(context).removeCurrentSnackBar();
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Row(
+                  children: const [
+                    Icon(Icons.wifi_off, color: Colors.white),
+                    SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        "No internet connection. Please check your internet and try again.",
+                        style: TextStyle(color: Colors.white),
+                      ),
+                    ),
+                  ],
+                ),
+                backgroundColor: const Color(0xFF8E4692),
+                duration: const Duration(seconds: 4),
+                behavior: SnackBarBehavior.floating,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            );
+          }
+          return;
+        }
+
         if (_webViewController != null) {
           _forceApplyStatusBarStyle();
           await _webViewController!.reload();
@@ -76,9 +110,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
     );
 
     _forceApplyStatusBarStyle();
-   // _checkConnectivity();
+    _checkConnectivity();
     _initializeNotifications();
-   // _listenToConnectivityChanges();
+    _listenToConnectivityChanges();
     _initializePermissionsAndSplash();
   }
 
@@ -88,7 +122,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     } catch (e) {
       debugPrint('Init Error Log: $e');
     }
-    
+
     await Future.delayed(Duration(seconds: AppConfig.splashDurationSeconds));
     if (mounted) {
       setState(() {
@@ -104,12 +138,35 @@ class _WebViewScreenState extends State<WebViewScreen> {
     super.dispose();
   }
 
+  Future<void> _loadCachedUrls() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      setState(() {
+        _cachedUrls = (prefs.getStringList('cached_urls') ?? []).toSet();
+      });
+    } catch (e) {
+      debugPrint('Error loading cached URLs: $e');
+    }
+  }
+
+  bool _isUrlCached(String urlString) {
+    if (_cachedUrls.contains(urlString)) return true;
+    final withoutQuery = urlString.split('?').first;
+    if (_cachedUrls.contains(withoutQuery)) return true;
+    if (urlString.endsWith('/')) {
+      if (_cachedUrls.contains(urlString.substring(0, urlString.length - 1))) return true;
+    } else {
+      if (_cachedUrls.contains('$urlString/')) return true;
+    }
+    return false;
+  }
+
   bool _otpListenerActive = false;
 
   Future<void> _startOTPListener() async {
     if (!Platform.isAndroid || _otpListenerActive) return;
     _otpListenerActive = true;
-    
+
     try {
       debugPrint('📱 Starting SMS Listener for OTP...');
       final res = await _smartAuth.getSmsWithUserConsentApi();
@@ -117,9 +174,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
         final code = res.data!.code;
         debugPrint('✅ OTP Extracted natively: $code');
         if (_webViewController != null && code != null) {
-          await _webViewController!.evaluateJavascript(
-            source: "window.__autofillOTP('$code');"
-          );
+          await _webViewController!
+              .evaluateJavascript(source: "window.__autofillOTP('$code');");
         }
       }
     } catch (e) {
@@ -920,7 +976,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
             if (userId != null && userId.isNotEmpty) {
               debugPrint('👤 User ID: $userId');
-           }
+            }
 
             await _saveFCMTokenIfPhoneAvailable();
 
@@ -965,7 +1021,27 @@ class _WebViewScreenState extends State<WebViewScreen> {
             }
           }
           
-          // Intercept clicks on links
+          // Maintain a local storage mirror of visited URLs
+          var visitedUrls = JSON.parse(localStorage.getItem('visitedUrls') || '[]');
+          
+          function addUrlToCache(urlStr) {
+             var cleanUrl = urlStr.split('#')[0];
+             if (!visitedUrls.includes(cleanUrl)) {
+                visitedUrls.push(cleanUrl);
+                localStorage.setItem('visitedUrls', JSON.stringify(visitedUrls));
+             }
+          }
+          
+          addUrlToCache(location.href);
+          
+          function isUrlCached(urlStr) {
+             var cleanUrl = urlStr.split('#')[0];
+             return visitedUrls.includes(cleanUrl) || 
+                    visitedUrls.includes(cleanUrl + '/') || 
+                    visitedUrls.includes(cleanUrl.replace(/\/$/, ''));
+          }
+          
+          // Intercept clicks on links for SPA and normal navigation
           document.addEventListener('click', function(e) {
             var target = e.target;
             while (target && target.tagName !== 'A') {
@@ -978,12 +1054,52 @@ class _WebViewScreenState extends State<WebViewScreen> {
                  if (href.startsWith('tel:') || 
                      href.startsWith('mailto:') || 
                      href.includes('wa.me') || 
-                     href.includes('whatsapp.com')) {
-                   // Let default handling or other interceptors work
+                     href.includes('whatsapp.com') ||
+                     href.startsWith('javascript:')) {
+                   return;
+                 }
+                 
+                 var targetUrl = new URL(href, location.href).href;
+                 if (!navigator.onLine && !isUrlCached(targetUrl)) {
+                   e.preventDefault();
+                   e.stopPropagation();
+                   callFlutterHandler('showOfflinePopup', targetUrl);
+                   return;
+                 }
+                 
+                 if (navigator.onLine) {
+                   addUrlToCache(targetUrl);
                  }
               }
             }
           }, true);
+
+          // Intercept SPA route changes
+          var originalPushState = history.pushState;
+          history.pushState = function(state, title, url) {
+             if (url) {
+                var targetUrl = new URL(url, location.href).href;
+                if (!navigator.onLine && !isUrlCached(targetUrl)) {
+                   callFlutterHandler('showOfflinePopup', targetUrl);
+                   return; // BLOCK IT!
+                }
+                addUrlToCache(targetUrl);
+             }
+             return originalPushState.apply(this, arguments);
+          };
+          
+          var originalReplaceState = history.replaceState;
+          history.replaceState = function(state, title, url) {
+             if (url) {
+                var targetUrl = new URL(url, location.href).href;
+                if (!navigator.onLine && !isUrlCached(targetUrl)) {
+                   callFlutterHandler('showOfflinePopup', targetUrl);
+                   return; // BLOCK IT!
+                }
+                addUrlToCache(targetUrl);
+             }
+             return originalReplaceState.apply(this, arguments);
+          };
         })();
       """;
 
@@ -995,20 +1111,15 @@ class _WebViewScreenState extends State<WebViewScreen> {
     }
   }
 
+  bool _connectivityChecked = false;
+
   /// Check initial connectivity status
-  // Future<void> _checkConnectivity() async {
-  //   final isConnected = await ConnectivityUtil.isConnected();
-  //   if (mounted) {
-  //     setState(() {
-  //       _isOnline = isConnected;
-  //     });
-  //   }
-  // }
   Future<void> _checkConnectivity() async {
     final isConnected = await ConnectivityUtil.isConnected();
     if (mounted) {
       setState(() {
         _isOnline = isConnected;
+        _connectivityChecked = true;
       });
     }
   }
@@ -1023,6 +1134,26 @@ class _WebViewScreenState extends State<WebViewScreen> {
       );
 
       if (mounted) {
+        if (!_isOnline && isConnected) {
+          // Internet restored, reload webview
+          if (_webViewController != null) {
+            _webViewController!.setSettings(
+              settings: InAppWebViewSettings(
+                cacheMode: CacheMode.LOAD_DEFAULT,
+              ),
+            );
+            _webViewController!.reload();
+          }
+        } else if (_isOnline && !isConnected) {
+          // Internet lost, update cache mode
+          if (_webViewController != null) {
+            _webViewController!.setSettings(
+              settings: InAppWebViewSettings(
+                cacheMode: CacheMode.LOAD_CACHE_ELSE_NETWORK,
+              ),
+            );
+          }
+        }
         setState(() {
           _isOnline = isConnected;
         });
@@ -1418,8 +1549,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
   double _relativeLuminance(Color color) {
     double linearize(int c) {
       final s = c / 255.0;
-      return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) * ((s + 0.055) / 1.055);
+      return s <= 0.03928
+          ? s / 12.92
+          : ((s + 0.055) / 1.055) * ((s + 0.055) / 1.055);
     }
+
     return 0.2126 * linearize(color.red) +
         0.7152 * linearize(color.green) +
         0.0722 * linearize(color.blue);
@@ -1428,16 +1562,18 @@ class _WebViewScreenState extends State<WebViewScreen> {
   void _forceApplyStatusBarStyle() {
     // On Android 10-14, edgeToEdge is disabled. We explicitly color the OS status bar teal
     // and the navigation bar white to seamlessly blend with the app.
-    final Color nativeStatusBarColor = (Platform.isAndroid && AppConfig.androidSdkInt < 35)
-        ? _statusBarColor
-        : Colors.transparent;
-    final Color nativeNavBarColor = (Platform.isAndroid && AppConfig.androidSdkInt < 35)
-        ? Colors.white
-        : Colors.transparent;
+    final Color nativeStatusBarColor =
+        (Platform.isAndroid && AppConfig.androidSdkInt < 35)
+            ? _statusBarColor
+            : Colors.transparent;
+    final Color nativeNavBarColor =
+        (Platform.isAndroid && AppConfig.androidSdkInt < 35)
+            ? Colors.white
+            : Colors.transparent;
 
     SystemChrome.setSystemUIOverlayStyle(
       SystemUiOverlayStyle(
-        statusBarColor: nativeStatusBarColor, 
+        statusBarColor: nativeStatusBarColor,
         systemNavigationBarColor: nativeNavBarColor,
         statusBarIconBrightness: _statusBarIconBrightness,
         statusBarBrightness: _statusBarIconBrightness == Brightness.light
@@ -1472,7 +1608,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     // native channel so WindowInsetsControllerCompat is called directly —
     // this covers cases where the deprecated SystemChrome path is ignored.
     if (Platform.isAndroid) {
-      const _channel = MethodChannel('com.buytogether.app/statusbar');
+      const _channel = MethodChannel('com.appzeto.createbharat/statusbar');
       _channel.invokeMethod('setIconBrightness', {
         'isLight': icons == Brightness.dark, // isLight=true means dark icons
       }).catchError((_) {/* channel not yet set up or called too early */});
@@ -1597,7 +1733,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
     }
   }
 
-  Future<void> _injectOTPAutofillScript(InAppWebViewController controller) async {
+  Future<void> _injectOTPAutofillScript(
+      InAppWebViewController controller) async {
     const script = '''
       (function() {
         if (window.__otpInjectorReady) return;
@@ -1758,8 +1895,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final initialUrlStr = AppConfig.webUrl;
+    final isInitialCached = _isUrlCached(initialUrlStr);
+    
+    // If offline and the initial URL is completely uncached, do not even create the WebView.
+    final shouldBlockWebViewCreation = !_isOnline && !isInitialCached && _connectivityChecked;
+
     return AnnotatedRegion<SystemUiOverlayStyle>(
-value: SystemUiOverlayStyle(
+      value: SystemUiOverlayStyle(
         // Transparent because the Container widget below physically fills the
         // status bar area with _statusBarColor — this bypasses the deprecated
         // Android window.statusBarColor API that is ignored on API 35+.
@@ -1777,27 +1920,37 @@ value: SystemUiOverlayStyle(
             children: [
               Column(
                 children: [
-              // ── Status bar fill ───────────────────────────────────────────
-              // On Android 15+, this paints the transparent OS status bar teal.
-              // On Android 10-14, the OS explicitly paints the native status bar teal,
-              // so this Container becomes a 0-height non-existent spacer because the 
-              // shrunk app window starts perfectly below the native status bar.
-              Container(
-                height: (Platform.isAndroid && AppConfig.androidSdkInt < 35) ? 0.0 : MediaQuery.of(context).viewPadding.top,
-                color: _statusBarColor,
-              ),
-              // ── Page content (starts below status bar) ────────────────────
-              Expanded(
-                child: _isOnline
-                ? Stack(
-                    children: [
-                    InAppWebView(
-                      initialUrlRequest: URLRequest(
-                        url: WebUri(AppConfig.webUrl),
-                      ),
-                      initialUserScripts: UnmodifiableListView<UserScript>([
-                        UserScript(
-                          source: """
+                  // ── Status bar fill ───────────────────────────────────────────
+                  // On Android 15+, this paints the transparent OS status bar teal.
+                  // On Android 10-14, the OS explicitly paints the native status bar teal,
+                  // so this Container becomes a 0-height non-existent spacer because the
+                  // shrunk app window starts perfectly below the native status bar.
+                  Container(
+                    height: (Platform.isAndroid && AppConfig.androidSdkInt < 35)
+                        ? 0.0
+                        : MediaQuery.of(context).viewPadding.top,
+                    color: _statusBarColor,
+                  ),
+                  // ── Page content (starts below status bar) ────────────────────
+                  Expanded(
+                    child: !_connectivityChecked
+                        ? const SizedBox.shrink()
+                        : Stack(
+                            children: [
+                              if (shouldBlockWebViewCreation)
+                                _buildOfflineUI()
+                              else
+                                InAppWebView(
+                                initialUrlRequest: URLRequest(
+                                  url: WebUri(AppConfig.webUrl),
+                                  cachePolicy: _isOnline 
+                                      ? URLRequestCachePolicy.USE_PROTOCOL_CACHE_POLICY 
+                                      : URLRequestCachePolicy.RETURN_CACHE_DATA_ELSE_LOAD,
+                                ),
+                                initialUserScripts:
+                                    UnmodifiableListView<UserScript>([
+                                  UserScript(
+                                    source: """
                             // 1. Polyfill navigator.share to use Flutter native share
                             if (typeof navigator.share === 'undefined' || !navigator.share) {
                               navigator.share = async function(data) {
@@ -1823,861 +1976,1192 @@ value: SystemUiOverlayStyle(
                                 return originalWriteText.apply(navigator.clipboard, arguments);
                               };
                             }
+                            
+                            // 3. Intercept file inputs to open Gallery natively
+                            document.addEventListener('click', function(e) {
+                              let target = e.target;
+                              while (target && target.tagName !== 'INPUT') {
+                                target = target.parentNode;
+                              }
+                              if (target && target.tagName === 'INPUT' && target.type === 'file') {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                
+                                window._lastClickedFileInput = target;
+                                if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
+                                  window.flutter_inappwebview.callHandler('openGalleryForFilePicker');
+                                }
+                              }
+                            }, true);
+                            
+                            const originalClick = HTMLInputElement.prototype.click;
+                            HTMLInputElement.prototype.click = function() {
+                              if (this.type === 'file') {
+                                window._lastClickedFileInput = this;
+                                if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
+                                  window.flutter_inappwebview.callHandler('openGalleryForFilePicker');
+                                }
+                                return;
+                              }
+                              originalClick.call(this);
+                            };
                           """,
-                          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
-                        )
-                      ]),
-                      pullToRefreshController: _pullToRefreshController,
-                      initialSettings: InAppWebViewSettings(
-                        userAgent:
-                            'Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36',
-                        javaScriptEnabled: true,
-                        javaScriptCanOpenWindowsAutomatically: false,
-                        domStorageEnabled: true,
-                        databaseEnabled: true,
-                        mediaPlaybackRequiresUserGesture: false,
-                        allowsInlineMediaPlayback: true,
-                        useOnDownloadStart: true,
-                        geolocationEnabled: true,
-                        supportZoom: true,
-                        builtInZoomControls: true,
-                        displayZoomControls: false,
-                        safeBrowsingEnabled: true,
-                        mixedContentMode:
-                            MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
-                        allowFileAccess: true,
-                        allowFileAccessFromFileURLs: true,
-                        allowUniversalAccessFromFileURLs: true,
-                        useOnLoadResource: true,
-                        useShouldOverrideUrlLoading: true,
-                        verticalScrollBarEnabled: false,
-                        horizontalScrollBarEnabled: false,
-                      ),
-                      onReceivedError: (controller, request, error){
-                        debugPrint(request.toString());
-                        if(request.isForMainFrame == true || request.url.toString().endsWith('.js')){
-                          setState(() {
-                          _isOnline = false;
-                        });
-                        }
-                      },
-                      onCreateWindow: (controller, createWindowRequest) async {
-                        final urlRequest = createWindowRequest.request;
-                        var url = urlRequest.url;
-                        debugPrint('🪟 onCreateWindow: url=$url');
+                                    injectionTime: UserScriptInjectionTime
+                                        .AT_DOCUMENT_START,
+                                  )
+                                ]),
+                                pullToRefreshController:
+                                    _pullToRefreshController,
+                                initialSettings: InAppWebViewSettings(
+                                  cacheEnabled: true,
+                                  cacheMode: _isOnline 
+                                      ? CacheMode.LOAD_DEFAULT 
+                                      : CacheMode.LOAD_CACHE_ELSE_NETWORK,
+                                  userAgent:
+                                      'Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36',
+                                  javaScriptEnabled: true,
+                                  javaScriptCanOpenWindowsAutomatically: false,
+                                  domStorageEnabled: true,
+                                  databaseEnabled: true,
+                                  mediaPlaybackRequiresUserGesture: false,
+                                  allowsInlineMediaPlayback: true,
+                                  useOnDownloadStart: true,
+                                  geolocationEnabled: true,
+                                  supportZoom: true,
+                                  builtInZoomControls: true,
+                                  displayZoomControls: false,
+                                  safeBrowsingEnabled: true,
+                                  mixedContentMode: MixedContentMode
+                                      .MIXED_CONTENT_ALWAYS_ALLOW,
+                                  allowFileAccess: true,
+                                  allowFileAccessFromFileURLs: true,
+                                  allowUniversalAccessFromFileURLs: true,
+                                  useOnLoadResource: true,
+                                  useShouldOverrideUrlLoading: true,
+                                  verticalScrollBarEnabled: false,
+                                  horizontalScrollBarEnabled: false,
+                                ),
+                                onReceivedError: (controller, request, error) async {
+                                  debugPrint(request.toString());
+                                  if (request.isForMainFrame ?? true) {
+                                    final canGoBack = await controller.canGoBack();
+                                    
+                                    setState(() {
+                                      _isLoading = false;
+                                      _isInitialLoad = false;
+                                    });
+                                    
+                                    if (canGoBack) {
+                                      final currentUrl = await controller.getUrl();
+                                      if (currentUrl?.toString() == request.url.toString()) {
+                                        await controller.goBack();
+                                      }
+                                      _showOfflinePopup();
+                                    } else {
+                                      setState(() {
+                                        _pageLoadFailed = true;
+                                      });
+                                    }
+                                  }
+                                },
+                                onCreateWindow:
+                                    (controller, createWindowRequest) async {
+                                  final urlRequest =
+                                      createWindowRequest.request;
+                                  var url = urlRequest.url;
+                                  debugPrint('🪟 onCreateWindow: url=$url');
 
-                        if (url == null) return false;
+                                  if (url == null) return false;
 
-                        // Check for Razorpay UPI app SVG URLs FIRST
-                        // Use stricter check that handles query params
-                        if (url.host.contains('razorpay.com') &&
-                            url.toString().contains('/app/') &&
-                            (url.path.endsWith('.svg') ||
-                                url.toString().contains('.svg'))) {
-                          debugPrint(
-                              '💳 onCreateWindow: Detected Razorpay UPI app SVG, intercepting...');
-                          final upiAppUri =
-                              await _handleRazorpayUPIAppClick(url);
-                          if (upiAppUri != null) {
-                            await _launchExternalUrl(upiAppUri);
-                            return false;
-                          }
-                        }
+                                  // Check for Razorpay UPI app SVG URLs FIRST
+                                  // Use stricter check that handles query params
+                                  if (url.host.contains('razorpay.com') &&
+                                      url.toString().contains('/app/') &&
+                                      (url.path.endsWith('.svg') ||
+                                          url.toString().contains('.svg'))) {
+                                    debugPrint(
+                                        '💳 onCreateWindow: Detected Razorpay UPI app SVG, intercepting...');
+                                    final upiAppUri =
+                                        await _handleRazorpayUPIAppClick(url);
+                                    if (upiAppUri != null) {
+                                      await _launchExternalUrl(upiAppUri);
+                                      return false;
+                                    }
+                                  }
 
-                        // Handle non-HTTP schemes
-                        final allowedSchemes = [
-                          'http',
-                          'https',
-                          'file',
-                          'chrome',
-                          'data',
-                          'javascript'
-                        ];
-                        if (!allowedSchemes
-                            .contains(url.scheme.toLowerCase())) {
-                          if (await canLaunchUrl(url)) {
-                            await launchUrl(url,
-                                mode: LaunchMode.externalApplication);
-                            return false;
-                          }
-                        }
+                                  // Handle non-HTTP schemes
+                                  final allowedSchemes = [
+                                    'http',
+                                    'https',
+                                    'file',
+                                    'chrome',
+                                    'data',
+                                    'javascript'
+                                  ];
+                                  if (!allowedSchemes
+                                      .contains(url.scheme.toLowerCase())) {
+                                    if (await canLaunchUrl(url)) {
+                                      await launchUrl(url,
+                                          mode: LaunchMode.externalApplication);
+                                      return false;
+                                    }
+                                  }
 
-                        if (_shouldLaunchExternally(url)) {
-                          await _launchExternalUrl(url);
-                          return false;
-                        }
+                                  if (_shouldLaunchExternally(url)) {
+                                    await _launchExternalUrl(url);
+                                    return false;
+                                  }
 
-                        controller.loadUrl(urlRequest: urlRequest);
-                        return true;
+                                  controller.loadUrl(urlRequest: urlRequest);
+                                  return true;
+                                },
+                                shouldOverrideUrlLoading:
+                                    (controller, navigationAction) async {
+                                  final urlRequest = navigationAction.request;
+                                  final uri = urlRequest.url;
 
-                        // ✅ REGISTER FILE CHOOSER HERE (v6.1.5)
+                                  if (uri == null)
+                                    return NavigationActionPolicy.ALLOW;
 
-                        debugPrint(
-                            '✅ WebView created & file chooser registered');
-                      },
-                      shouldOverrideUrlLoading:
-                          (controller, navigationAction) async {
-                        final urlRequest = navigationAction.request;
-                        final uri = urlRequest.url;
+                                  final urlStr = uri.toString();
+                                  if (!_isOnline && !_isUrlCached(urlStr) && !urlStr.startsWith('tel:') && !urlStr.startsWith('mailto:')) {
+                                    _showOfflinePopup();
+                                    return NavigationActionPolicy.CANCEL;
+                                  }
 
-                        if (uri == null) return NavigationActionPolicy.ALLOW;
+                                  debugPrint('➡️ Navigating: $uri');
 
-                        debugPrint('➡️ Navigating: $uri');
+                                  // 1. Check for Intent Scheme (Android)
+                                  if (uri.scheme.toLowerCase() == 'intent') {
+                                    await _handleIntentUrl(uri);
+                                    return NavigationActionPolicy.CANCEL;
+                                  }
 
-                        // 1. Check for Intent Scheme (Android)
-                        if (uri.scheme.toLowerCase() == 'intent') {
-                          await _handleIntentUrl(uri);
-                          return NavigationActionPolicy.CANCEL;
-                        }
+                                  // 2. Check for Phone/Tel Scheme
+                                  if (uri.scheme.toLowerCase() == 'tel') {
+                                    debugPrint(
+                                        '🤖 Detected Intent scheme, launching...');
+                                    try {
+                                      await launchUrl(uri,
+                                          mode: LaunchMode.externalApplication);
+                                      return NavigationActionPolicy.CANCEL;
+                                    } catch (e) {
+                                      debugPrint(
+                                          '❌ Failed to launch intent: $e');
+                                      // Continue to allow fallback URL processing if handled by webview?
+                                      // Usually fallback urls are inside the intent string, complex to parse here.
+                                    }
+                                  }
 
-                        // 2. Check for Phone/Tel Scheme
-                        if (uri.scheme.toLowerCase() == 'tel') {
-                          debugPrint('🤖 Detected Intent scheme, launching...');
-                          try {
-                            await launchUrl(uri,
-                                mode: LaunchMode.externalApplication);
-                            return NavigationActionPolicy.CANCEL;
-                          } catch (e) {
-                            debugPrint('❌ Failed to launch intent: $e');
-                            // Continue to allow fallback URL processing if handled by webview?
-                            // Usually fallback urls are inside the intent string, complex to parse here.
-                          }
-                        }
+                                  // 2. Check for UPI deep links
+                                  if (uri.scheme.toLowerCase() == 'upi') {
+                                    debugPrint('💳 Detected UPI URL: $uri');
+                                    await _launchExternalUrl(uri);
+                                    return NavigationActionPolicy.CANCEL;
+                                  }
 
-                        // 2. Check for UPI deep links
-                        if (uri.scheme.toLowerCase() == 'upi') {
-                          debugPrint('💳 Detected UPI URL: $uri');
-                          await _launchExternalUrl(uri);
-                          return NavigationActionPolicy.CANCEL;
-                        }
+                                  // 3. Check for Razorpay UPI SVG
+                                  final upiAppUri =
+                                      await _handleRazorpayUPIAppClick(uri);
+                                  if (upiAppUri != null) {
+                                    await _launchExternalUrl(upiAppUri);
+                                    return NavigationActionPolicy.CANCEL;
+                                  }
 
-                        // 3. Check for Razorpay UPI SVG
-                        final upiAppUri = await _handleRazorpayUPIAppClick(uri);
-                        if (upiAppUri != null) {
-                          await _launchExternalUrl(upiAppUri);
-                          return NavigationActionPolicy.CANCEL;
-                        }
+                                  // 4. Handle other non-HTTP schemes
+                                  final allowedSchemes = [
+                                    'http',
+                                    'https',
+                                    'file',
+                                    'chrome',
+                                    'data',
+                                    'javascript',
+                                    'about'
+                                  ];
+                                  if (!allowedSchemes
+                                      .contains(uri.scheme.toLowerCase())) {
+                                    await _launchExternalUrl(uri);
+                                    return NavigationActionPolicy.CANCEL;
+                                  }
 
-                        // 4. Handle other non-HTTP schemes
-                        final allowedSchemes = [
-                          'http',
-                          'https',
-                          'file',
-                          'chrome',
-                          'data',
-                          'javascript',
-                          'about'
-                        ];
-                        if (!allowedSchemes
-                            .contains(uri.scheme.toLowerCase())) {
-                          await _launchExternalUrl(uri);
-                          return NavigationActionPolicy.CANCEL;
-                        }
+                                  // 5. External launch check
+                                  if (_shouldLaunchExternally(uri)) {
+                                    await _launchExternalUrl(uri);
+                                    return NavigationActionPolicy.CANCEL;
+                                  }
 
-                        // 5. External launch check
-                        if (_shouldLaunchExternally(uri)) {
-                          await _launchExternalUrl(uri);
-                          return NavigationActionPolicy.CANCEL;
-                        }
+                                  return NavigationActionPolicy.ALLOW;
+                                },
+                                onWebViewCreated: (controller) async {
+                                  _forceApplyStatusBarStyle();
+                                  _webViewController = controller;
 
-                        return NavigationActionPolicy.ALLOW;
-                      },
-                      onWebViewCreated: (controller) async {
-                        _forceApplyStatusBarStyle();
-                        _webViewController = controller;
+                                  debugPrint('✅ WebView created');
 
-                        debugPrint('✅ WebView created');
-
-                        // ── Dynamic Status Bar colour bridge ──────────────
-                        // The JS detector script (injected in onLoadStop)
-                        // calls this handler with the page's top-section colour.
-                        controller.addJavaScriptHandler(
-                          handlerName: 'startOTPListener',
-                          callback: (args) {
-                            _startOTPListener();
-                          },
-                        );
-
-                        controller.addJavaScriptHandler(
-                          handlerName: 'updateStatusBarColor',
-                          callback: (args) {
-                            if (args.isNotEmpty) {
-                              final colorStr = args[0].toString();
-                              
-                              // Prevent white flashes: If the page is currently loading,
-                              // the DOM might briefly be empty/white. We ignore white 
-                              // updates during this phase so the status bar retains 
-                              // the app theme consistently.
-                              if (_isLoading) {
-                                final s = colorStr.replaceAll(' ', '').toLowerCase();
-                                if (s == 'rgb(255,255,255)' || s == '#ffffff') {
-                                  return;
-                                }
-                              }
-                              
-                              _applyStatusBarColor(colorStr);
-                            }
-                          },
-                        );
-                        // ─────────────────────────────────────────────────
-
-                        // Native Location Button Click Bridge
-                        controller.addJavaScriptHandler(
-                          handlerName: 'locationButtonClicked',
-                          callback: (args) async {
-                            _locationButtonClickDetected = true;
-                            debugPrint('📍 Web location button click detected');
-
-                            // PROACTIVE: Jump to settings immediately upon click if things are disabled
-                            bool serviceEnabled =
-                                await Geolocator.isLocationServiceEnabled();
-                            if (!serviceEnabled) {
-                              await Geolocator
-                                  .openLocationSettings(); // Opens GPS toggle
-                              return;
-                            }
-
-                            var status = await Permission.location.status;
-                            if (status.isPermanentlyDenied) {
-                              await openAppSettings(); // Opens Permissions
-                              return;
-                            }
-
-                            if (status.isDenied) {
-                              status = await Permission.location.request();
-                              if (!status.isGranted) {
-                                await openAppSettings(); // Forces settings if rejected
-                              }
-                            }
-                          },
-                        );
-
-                        // Native Google Sign-In Javascript Bridge
-                        controller.addJavaScriptHandler(
-                          handlerName: 'nativeGoogleSignIn',
-                          callback: (args) async {
-                            try {
-                              debugPrint('🟢 Triggering Native Google Sign In');
-
-                              // 1. Show the Native Android Account List
-                              final GoogleSignInAccount? googleUser =
-                                  await GoogleSignIn().signIn();
-                              if (googleUser == null) {
-                                debugPrint(
-                                    '⚠️ Google Sign-In Cancelled by User');
-                                return {
-                                  'success': false,
-                                  'cancelled': true,
-                                  'error': 'USER_CANCELLED'
-                                };
-                              }
-
-                              // 2. Get the authentication tokens
-                              final GoogleSignInAuthentication googleAuth =
-                                  await googleUser.authentication;
-                              final idToken = googleAuth.idToken;
-                              final accessToken = googleAuth.accessToken;
-
-                              if ((idToken == null || idToken.isEmpty) &&
-                                  (accessToken == null ||
-                                      accessToken.isEmpty)) {
-                                return {
-                                  'success': false,
-                                  'cancelled': false,
-                                  'error': 'SIGN_IN_FAILED',
-                                  'message':
-                                      'Failed to retrieve Google authentication tokens'
-                                };
-                              }
-
-                              // 3. Authenticate with Firebase natively (Optional but recommended for full integration)
-                              try {
-                                if (idToken != null &&
-                                    idToken.isNotEmpty &&
-                                    accessToken != null &&
-                                    accessToken.isNotEmpty) {
-                                  final OAuthCredential credential =
-                                      GoogleAuthProvider.credential(
-                                    accessToken: accessToken,
-                                    idToken: idToken,
+                                  // ── Dynamic Status Bar colour bridge ──────────────
+                                  // The JS detector script (injected in onLoadStop)
+                                  // calls this handler with the page's top-section colour.
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'startOTPListener',
+                                    callback: (args) {
+                                      _startOTPListener();
+                                    },
                                   );
-                                  await FirebaseAuth.instance
-                                      .signInWithCredential(credential);
-                                  debugPrint('✅ Firebase Native Auth Success');
-                                }
-                              } catch (e) {
-                                debugPrint('⚠️ Firebase Auth warning: $e');
-                              }
 
-                              debugPrint(
-                                  '✅ Native Google Sign In Success, passing token to web...');
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'updateStatusBarColor',
+                                    callback: (args) {
+                                      if (args.isNotEmpty) {
+                                        final colorStr = args[0].toString();
 
-                              // 4. Return the Google Tokens back to the website Javascript
-                              final Map<String, dynamic> response = {
-                                'success': true,
-                                'email': googleUser.email,
-                                'displayName': googleUser.displayName,
-                                'photoUrl': googleUser.photoUrl
-                              };
+                                        // Prevent white flashes: If the page is currently loading,
+                                        // the DOM might briefly be empty/white. We ignore white
+                                        // updates during this phase so the status bar retains
+                                        // the app theme consistently.
+                                        if (_isLoading) {
+                                          final s = colorStr
+                                              .replaceAll(' ', '')
+                                              .toLowerCase();
+                                          if (s == 'rgb(255,255,255)' ||
+                                              s == '#ffffff') {
+                                            return;
+                                          }
+                                        }
 
-                              if (idToken != null && idToken.isNotEmpty) {
-                                response['idToken'] = idToken;
-                              }
+                                        _applyStatusBarColor(colorStr);
+                                      }
+                                    },
+                                  );
+                                  // ─────────────────────────────────────────────────
 
-                              if (accessToken != null &&
-                                  accessToken.isNotEmpty) {
-                                response['accessToken'] = accessToken;
-                              }
+                                  // Native Location Button Click Bridge
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'locationButtonClicked',
+                                    callback: (args) async {
+                                      _locationButtonClickDetected = true;
+                                      debugPrint(
+                                          '📍 Web location button click detected');
 
-                              return response;
-                            } catch (error) {
-                              debugPrint('❌ Google Sign-In Error: $error');
-                              return {
-                                'success': false,
-                                'cancelled': false,
-                                'error': 'SIGN_IN_FAILED',
-                                'message': error.toString()
-                              };
-                            }
-                          },
-                        );
+                                      // PROACTIVE: Jump to settings immediately upon click if things are disabled
+                                      bool serviceEnabled = await Geolocator
+                                          .isLocationServiceEnabled();
+                                      if (!serviceEnabled) {
+                                        await Geolocator
+                                            .openLocationSettings(); // Opens GPS toggle
+                                        return;
+                                      }
 
-                        // Native Google Sign-Out Javascript Bridge
-                        controller.addJavaScriptHandler(
-                          handlerName: 'nativeGoogleSignOut',
-                          callback: (args) async {
-                            try {
-                              debugPrint(
-                                  '🟢 Triggering Native Google Sign Out');
-                              await GoogleSignIn().signOut();
-                              await FirebaseAuth.instance.signOut();
-                              return {'success': true};
-                            } catch (error) {
-                              debugPrint('❌ Google Sign-Out Error: $error');
-                              return {
-                                'success': false,
-                                'error': error.toString()
-                              };
-                            }
-                          },
-                        );
+                                      var status =
+                                          await Permission.location.status;
+                                      if (status.isPermanentlyDenied) {
+                                        await openAppSettings(); // Opens Permissions
+                                        return;
+                                      }
 
-                        // Add JavaScript handler to open camera directly
-                        controller.addJavaScriptHandler(
-                          handlerName: 'openCamera',
-                          callback: (args) async {
-                            try {
-                              // Because CAMERA is declared in AndroidManifest.xml, image_picker
-                              // requires it to be granted at runtime before pickImage(camera)
-                              // will return a photo — and it does NOT request it for us.
-                              var status = await Permission.camera.status;
-                              if (!status.isGranted) {
-                                status = await Permission.camera.request();
-                              }
-                              if (!status.isGranted) {
-                                debugPrint('⚠️ Camera permission not granted');
-                                if (status.isPermanentlyDenied) {
-                                  await openAppSettings();
-                                }
-                                return {
-                                  'success': false,
-                                  'error': 'CAMERA_PERMISSION_DENIED',
-                                };
-                              }
+                                      if (status.isDenied) {
+                                        status =
+                                            await Permission.location.request();
+                                        if (!status.isGranted) {
+                                          await openAppSettings(); // Forces settings if rejected
+                                        }
+                                      }
+                                    },
+                                  );
 
-                              // Open camera using image_picker
-                              final ImagePicker picker = ImagePicker();
-                              final XFile? image = await picker.pickImage(
-                                source: ImageSource.camera,
-                                imageQuality: 80,
-                              );
+                                  // Native Google Sign-In Javascript Bridge
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'nativeGoogleSignIn',
+                                    callback: (args) async {
+                                      try {
+                                        debugPrint(
+                                            '🟢 Triggering Native Google Sign In');
 
-                              if (image != null) {
-                                // Read file as base64
-                                final bytes = await image.readAsBytes();
-                                final base64String = base64Encode(bytes);
+                                        // 1. Show the Native Android Account List
+                                        final GoogleSignInAccount? googleUser =
+                                            await GoogleSignIn().signIn();
+                                        if (googleUser == null) {
+                                          debugPrint(
+                                              '⚠️ Google Sign-In Cancelled by User');
+                                          return {
+                                            'success': false,
+                                            'cancelled': true,
+                                            'error': 'USER_CANCELLED'
+                                          };
+                                        }
 
-                                // Return to JavaScript
-                                return {
-                                  'success': true,
-                                  'base64': base64String,
-                                  'mimeType': 'image/jpeg',
-                                  'fileName': image.name,
-                                };
-                              }
+                                        // 2. Get the authentication tokens
+                                        final GoogleSignInAuthentication
+                                            googleAuth =
+                                            await googleUser.authentication;
+                                        final idToken = googleAuth.idToken;
+                                        final accessToken =
+                                            googleAuth.accessToken;
 
-                              // image == null → user cancelled the camera.
-                              return {'success': false, 'cancelled': true};
-                            } catch (e) {
-                              debugPrint('❌ Error in openCamera handler: $e');
-                              return {'success': false, 'error': e.toString()};
-                            }
-                          },
-                        );
+                                        if ((idToken == null ||
+                                                idToken.isEmpty) &&
+                                            (accessToken == null ||
+                                                accessToken.isEmpty)) {
+                                          return {
+                                            'success': false,
+                                            'cancelled': false,
+                                            'error': 'SIGN_IN_FAILED',
+                                            'message':
+                                                'Failed to retrieve Google authentication tokens'
+                                          };
+                                        }
 
-                        // Add JavaScript handler to receive phone number from website
-                        controller.addJavaScriptHandler(
-                          handlerName: 'savePhoneNumber',
-                          callback: (args) async {
-                            if (args.isNotEmpty) {
-                              final phoneNumber = args[0].toString();
-                              debugPrint(
-                                '📱 Phone number received from website: $phoneNumber',
-                              );
-                              // Clean phone number (remove any non-digits, remove +91 prefix if present)
-                              String cleanedPhone = phoneNumber.replaceAll(
-                                RegExp(r'[^\d]'),
-                                '',
-                              );
-                              if (cleanedPhone.length > 10 &&
-                                  cleanedPhone.startsWith('91')) {
-                                cleanedPhone = cleanedPhone.substring(2);
-                              }
-                              if (cleanedPhone.length == 10) {
-                                await PrefsUtil.setPhoneNumber(cleanedPhone);
-                                debugPrint(
-                                  '✅ Phone number saved: $cleanedPhone',
-                                );
-                                // Save FCM token now that we have phone number
-                                await _saveFCMTokenIfPhoneAvailable();
-                              } else {
-                                debugPrint(
-                                  '⚠️ Invalid phone number format: $cleanedPhone',
-                                );
-                              }
-                            }
-                          },
-                        );
+                                        // 3. Authenticate with Firebase natively (Optional but recommended for full integration)
+                                        try {
+                                          if (idToken != null &&
+                                              idToken.isNotEmpty &&
+                                              accessToken != null &&
+                                              accessToken.isNotEmpty) {
+                                            final OAuthCredential credential =
+                                                GoogleAuthProvider.credential(
+                                              accessToken: accessToken,
+                                              idToken: idToken,
+                                            );
+                                            await FirebaseAuth.instance
+                                                .signInWithCredential(
+                                                    credential);
+                                            debugPrint(
+                                                '✅ Firebase Native Auth Success');
+                                          }
+                                        } catch (e) {
+                                          debugPrint(
+                                              '⚠️ Firebase Auth warning: $e');
+                                        }
 
-                        // Add nativeShare handler
-                        controller.addJavaScriptHandler(
-                          handlerName: 'nativeShare',
-                          callback: (arguments) async {
-                            return _handleNativeShare(arguments);
-                          },
-                        );
-                      },
-                      onLoadStart: (controller, url) {
-                        _forceApplyStatusBarStyle();
-                        setState(() {
-                          _isLoading = true;
-                          _phoneListenerInjected = false;
-                          _linkInterceptorInjected = false;
-                        });
-                        debugPrint('🌐 Loading started: $url');
-                      },
-                      onLoadStop: (controller, url) async {
-                        _forceApplyStatusBarStyle();
-                        setState(() {
-                          _isLoading = false;
-                          _isInitialLoad = false;
-                          _pullToRefreshController.endRefreshing();
-                          _loadingProgress = 1.0;
-                        });
-                        debugPrint('✅ Loading finished: $url');
-                        await _injectPhoneCaptureScript(controller);
-                        await _injectLinkInterceptorScript(controller);
-                        await _injectApiInterceptorScript(controller);
-                        await _injectOTPAutofillScript(controller);
-                        // Detect the page's top-section colour and adapt the status bar.
-                        await _injectStatusBarColorDetector(controller);
+                                        debugPrint(
+                                            '✅ Native Google Sign In Success, passing token to web...');
 
-                        // Fire ready event for website to detect bridge
-                        await controller.evaluateJavascript(
-                          source: '''
+                                        // 4. Return the Google Tokens back to the website Javascript
+                                        final Map<String, dynamic> response = {
+                                          'success': true,
+                                          'email': googleUser.email,
+                                          'displayName': googleUser.displayName,
+                                          'photoUrl': googleUser.photoUrl
+                                        };
+
+                                        if (idToken != null &&
+                                            idToken.isNotEmpty) {
+                                          response['idToken'] = idToken;
+                                        }
+
+                                        if (accessToken != null &&
+                                            accessToken.isNotEmpty) {
+                                          response['accessToken'] = accessToken;
+                                        }
+
+                                        return response;
+                                      } catch (error) {
+                                        debugPrint(
+                                            '❌ Google Sign-In Error: $error');
+                                        return {
+                                          'success': false,
+                                          'cancelled': false,
+                                          'error': 'SIGN_IN_FAILED',
+                                          'message': error.toString()
+                                        };
+                                      }
+                                    },
+                                  );
+
+                                  // Native Google Sign-Out Javascript Bridge
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'nativeGoogleSignOut',
+                                    callback: (args) async {
+                                      try {
+                                        debugPrint(
+                                            '🟢 Triggering Native Google Sign Out');
+                                        await GoogleSignIn().signOut();
+                                        await FirebaseAuth.instance.signOut();
+                                        return {'success': true};
+                                      } catch (error) {
+                                        debugPrint(
+                                            '❌ Google Sign-Out Error: $error');
+                                        return {
+                                          'success': false,
+                                          'error': error.toString()
+                                        };
+                                      }
+                                    },
+                                  );
+
+                                  // Add JS handler to intercept file pickers and open Gallery natively
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'openGalleryForFilePicker',
+                                    callback: (args) async {
+                                      try {
+                                        final ImagePicker picker = ImagePicker();
+                                        final XFile? image = await picker.pickImage(
+                                          source: ImageSource.gallery,
+                                          imageQuality: 80,
+                                        );
+
+                                        if (image != null) {
+                                          final bytes = await image.readAsBytes();
+                                          final base64String = base64Encode(bytes);
+                                          final fileName = image.name;
+
+                                          await controller.evaluateJavascript(source: """
+                                            (function() {
+                                              var inputElement = window._lastClickedFileInput;
+                                              if (inputElement) {
+                                                 fetch('data:image/jpeg;base64,$base64String')
+                                                 .then(res => res.blob())
+                                                 .then(blob => {
+                                                     const file = new File([blob], '$fileName', { type: 'image/jpeg' });
+                                                     const dt = new DataTransfer();
+                                                     dt.items.add(file);
+                                                     inputElement.files = dt.files;
+                                                     inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+                                                 });
+                                              }
+                                            })();
+                                          """);
+                                        }
+                                      } catch (e) {
+                                        debugPrint('❌ Error in openGalleryForFilePicker: $e');
+                                      }
+                                    }
+                                  );
+
+                                  // Add JavaScript handler to open camera directly
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'openCamera',
+                                    callback: (args) async {
+                                      try {
+                                        // Because CAMERA is declared in AndroidManifest.xml, image_picker
+                                        // requires it to be granted at runtime before pickImage(camera)
+                                        // will return a photo — and it does NOT request it for us.
+                                        var status =
+                                            await Permission.camera.status;
+                                        if (!status.isGranted) {
+                                          status =
+                                              await Permission.camera.request();
+                                        }
+                                        if (!status.isGranted) {
+                                          debugPrint(
+                                              '⚠️ Camera permission not granted');
+                                          if (status.isPermanentlyDenied) {
+                                            await openAppSettings();
+                                          }
+                                          return {
+                                            'success': false,
+                                            'error': 'CAMERA_PERMISSION_DENIED',
+                                          };
+                                        }
+
+                                        // Open camera using image_picker
+                                        final ImagePicker picker =
+                                            ImagePicker();
+                                        final XFile? image =
+                                            await picker.pickImage(
+                                          source: ImageSource.camera,
+                                          imageQuality: 80,
+                                        );
+
+                                        if (image != null) {
+                                          // Read file as base64
+                                          final bytes =
+                                              await image.readAsBytes();
+                                          final base64String =
+                                              base64Encode(bytes);
+
+                                          // Return to JavaScript
+                                          return {
+                                            'success': true,
+                                            'base64': base64String,
+                                            'mimeType': 'image/jpeg',
+                                            'fileName': image.name,
+                                          };
+                                        }
+
+                                        // image == null → user cancelled the camera.
+                                        return {
+                                          'success': false,
+                                          'cancelled': true
+                                        };
+                                      } catch (e) {
+                                        debugPrint(
+                                            '❌ Error in openCamera handler: $e');
+                                        return {
+                                          'success': false,
+                                          'error': e.toString()
+                                        };
+                                      }
+                                    },
+                                  );
+
+                                  // Add JavaScript handler to receive phone number from website
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'savePhoneNumber',
+                                    callback: (args) async {
+                                      if (args.isNotEmpty) {
+                                        final phoneNumber = args[0].toString();
+                                        debugPrint(
+                                          '📱 Phone number received from website: $phoneNumber',
+                                        );
+                                        // Clean phone number (remove any non-digits, remove +91 prefix if present)
+                                        String cleanedPhone =
+                                            phoneNumber.replaceAll(
+                                          RegExp(r'[^\d]'),
+                                          '',
+                                        );
+                                        if (cleanedPhone.length > 10 &&
+                                            cleanedPhone.startsWith('91')) {
+                                          cleanedPhone =
+                                              cleanedPhone.substring(2);
+                                        }
+                                        if (cleanedPhone.length == 10) {
+                                          await PrefsUtil.setPhoneNumber(
+                                              cleanedPhone);
+                                          debugPrint(
+                                            '✅ Phone number saved: $cleanedPhone',
+                                          );
+                                          // Save FCM token now that we have phone number
+                                          await _saveFCMTokenIfPhoneAvailable();
+                                        } else {
+                                          debugPrint(
+                                            '⚠️ Invalid phone number format: $cleanedPhone',
+                                          );
+                                        }
+                                      }
+                                    },
+                                  );
+
+                                  // Add nativeShare handler
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'nativeShare',
+                                    callback: (arguments) async {
+                                      return _handleNativeShare(arguments);
+                                    },
+                                  );
+
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'showOfflinePopup',
+                                    callback: (args) {
+                                      debugPrint('🚫 SPA offline blank screen caught -> popup');
+                                      _showOfflinePopup();
+                                    },
+                                  );
+                                  controller.addJavaScriptHandler(
+                                    handlerName: 'showOfflineFullScreen',
+                                    callback: (args) {
+                                      debugPrint('🚫 SPA offline blank screen caught -> full screen');
+                                      if (mounted) {
+                                        setState(() {
+                                          _pageLoadFailed = true;
+                                        });
+                                      }
+                                    },
+                                  );
+                                },
+                                onLoadStart: (controller, url) {
+                                  _forceApplyStatusBarStyle();
+                                  setState(() {
+                                    _isLoading = true;
+                                    _pageLoadFailed = false;
+                                    _phoneListenerInjected = false;
+                                    _linkInterceptorInjected = false;
+                                  });
+                                  debugPrint('🌐 Loading started: $url');
+                                },
+                                onLoadStop: (controller, url) async {
+                                  if (url != null) {
+                                    _cachedUrls.add(url.toString());
+                                    _cachedUrls.add(url.toString().split('?').first);
+                                    SharedPreferences.getInstance().then((prefs) {
+                                      prefs.setStringList('cached_urls', _cachedUrls.toList());
+                                    });
+                                  }
+                                  
+                                  _forceApplyStatusBarStyle();
+                                  setState(() {
+                                    _isLoading = false;
+                                    _isInitialLoad = false;
+                                    _pullToRefreshController.endRefreshing();
+                                    _loadingProgress = 1.0;
+                                  });
+                                  debugPrint('✅ Loading finished: $url');
+                                  await _injectPhoneCaptureScript(controller);
+                                  await _injectLinkInterceptorScript(
+                                      controller);
+                                  await _injectApiInterceptorScript(controller);
+                                  await _injectOTPAutofillScript(controller);
+                                  // Detect the page's top-section colour and adapt the status bar.
+                                  await _injectStatusBarColorDetector(
+                                      controller);
+
+                                  // Fire ready event for website to detect bridge
+                                  await controller.evaluateJavascript(
+                                    source: '''
                             window.__flutter_inappwebview_ready__ = true;
                             window.dispatchEvent(new Event('flutterInAppWebViewPlatformReady'));
                           ''',
-                        );
-                        
-                        // Restart OTP listener state on navigation
-                        await controller.evaluateJavascript(source: 'if (window.__otpInjectorReady) { window.__otpInjectorReady = false; }');
-                      },
-                      onProgressChanged: (controller, progress) {
-                        if (progress == 100) {
-                          _forceApplyStatusBarStyle();
-                        }
-                        setState(() {
-                          _loadingProgress = progress / 100;
-                          if (progress >= 100) {
-                            _isLoading = false;
-                            _isInitialLoad = false;
-                          }
-                        });
-                        debugPrint('📊 Loading progress: $progress%');
-                      },
-                      onLoadError: (controller, url, code, message) {
-                        _pullToRefreshController.endRefreshing();
-                        setState(() {
-                          _isLoading = false;
-                          _isInitialLoad = false;
-                        });
-                        debugPrint('❌ Load error: $message (code: $code)');
-                      },
-                      onGeolocationPermissionsShowPrompt:
-                          (controller, origin) async {
-                        return GeolocationPermissionShowPromptResponse(
-                            origin: origin, allow: true, retain: true);
-                      },
-                      onPermissionRequest: (controller, request) async {
-                        debugPrint(
-                            '🔒 Permission requested: ${request.resources}');
+                                  );
 
-                        final resources = request.resources;
-                        if (resources.contains(PermissionResourceType.CAMERA)) {
-                          final status = await Permission.camera.request();
-                          if (!status.isGranted) {
-                            return PermissionResponse(
-                              resources: resources,
-                              action: PermissionResponseAction.DENY,
-                            );
-                          }
-                        }
+                                  // Restart OTP listener state on navigation
+                                  await controller.evaluateJavascript(
+                                      source:
+                                          'if (window.__otpInjectorReady) { window.__otpInjectorReady = false; }');
 
-                        if (resources
-                            .contains(PermissionResourceType.MICROPHONE)) {
-                          final status = await Permission.microphone.request();
-                          if (!status.isGranted) {
-                            return PermissionResponse(
-                              resources: resources,
-                              action: PermissionResponseAction.DENY,
-                            );
-                          }
-                        }
-
-                        return PermissionResponse(
-                          resources: resources,
-                          action: PermissionResponseAction.GRANT,
-                        );
-                      },
-                      onConsoleMessage: (controller, consoleMessage) {
-                        debugPrint(
-                            '🌐 JS Console: ${consoleMessage.messageLevel}: ${consoleMessage.message}');
-                      },
-                      onDownloadStartRequest:
-                          (controller, downloadStartRequest) async {
-                        try {
-                          final url = downloadStartRequest.url.toString();
-                          final suggestedFilename =
-                              downloadStartRequest.suggestedFilename;
-                          final mimeType = downloadStartRequest.mimeType;
-                          final contentDisposition =
-                              downloadStartRequest.contentDisposition;
-
-                          debugPrint('📥 Download requested: $url');
-                          debugPrint(
-                              '📄 Suggested filename: $suggestedFilename');
-                          debugPrint('📋 MIME type: $mimeType');
-                          debugPrint(
-                              '📋 Content-Disposition: $contentDisposition');
-
-                          // Handle blob URLs - they need to be extracted via JavaScript
-                          if (url.startsWith('blob:')) {
-                            debugPrint(
-                                '🔵 Blob URL detected, extracting blob data...');
-                            await _handleBlobDownload(
-                              controller: controller,
-                              blobUrl: url,
-                              suggestedFilename:
-                                  suggestedFilename ?? 'receipt.pdf',
-                              mimeType: mimeType ?? 'application/pdf',
-                              isReceiptDownload: true,
-                            );
-                            return;
-                          }
-
-                          // Check if it's a receipt download
-                          final isReceiptDownload = url.contains('receipt') ||
-                              url.contains('download-receipt') ||
-                              url.contains('invoice') ||
-                              (suggestedFilename != null &&
-                                  (suggestedFilename
-                                          .toLowerCase()
-                                          .contains('receipt') ||
-                                      suggestedFilename
-                                          .toLowerCase()
-                                          .contains('invoice')));
-
-                          if (!mounted) return;
-
-                          // For Android 10+, app-specific directories don't require permission
-                          // Only request permission if we need public Downloads folder
-                          // But we'll try public Downloads first, fallback to app-specific if needed
-                          bool hasPermission = false;
-                          bool canDownload = true;
-
-                          if (isReceiptDownload) {
-                            // For receipts, try to get permission for public Downloads
-                            hasPermission = await PermissionHandlerUtil
-                                .checkStoragePermission();
-                            if (!hasPermission) {
-                              final granted = await PermissionHandlerUtil
-                                  .requestStoragePermission();
-                              if (!granted) {
-                                // Permission denied, but we can still download to app-specific folder
-                                debugPrint(
-                                    '⚠️ Permission denied, will use app-specific Downloads folder');
-                                hasPermission = false;
-                                canDownload =
-                                    true; // Still allow download to app folder
-                              } else {
-                                hasPermission = true;
-                              }
-                            } else {
-                              hasPermission = true;
-                            }
-                          } else {
-                            // For other files, app-specific directory doesn't need permission
-                            canDownload = true;
-                          }
-
-                          if (!canDownload) {
-                            if (mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text(
-                                      'Cannot download file. Please check storage permissions in app settings.'),
-                                  backgroundColor: Colors.orange,
-                                  duration: Duration(seconds: 3),
-                                ),
-                              );
-                            }
-                            return;
-                          }
-
-                          // Show download progress
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Row(
-                                  children: [
-                                    const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        valueColor:
-                                            AlwaysStoppedAnimation<Color>(
-                                                Colors.white),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 12),
-                                    Expanded(
-                                      child: Text(
-                                        isReceiptDownload
-                                            ? 'Downloading receipt...'
-                                            : 'Downloading file...',
-                                        style: const TextStyle(
-                                            color: Colors.white),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                backgroundColor: Colors.blue,
-                                duration: const Duration(seconds: 2),
-                              ),
-                            );
-                          }
-
-                          // Download the file
-                          // For Android 10+, app-specific directories don't require permission
-                          // Try public Downloads for receipts if permission granted, otherwise use app-specific
-                          final downloadService = DownloadService();
-                          DownloadResult result;
-
-                          if (isReceiptDownload && hasPermission) {
-                            // Try public Downloads folder first
-                            debugPrint(
-                                '📥 Attempting to download receipt to public Downloads folder...');
-                            result = await downloadService.downloadFile(
-                              url: url,
-                              contentDisposition: contentDisposition,
-                              context: context,
-                              usePublicDownloads: true, // Try public Downloads
-                              onProgress: (received, total) {
-                                if (total > 0) {
-                                  final progress = (received / total * 100)
-                                      .toStringAsFixed(1);
-                                  debugPrint(
-                                      '📥 Download progress: $progress%');
-                                }
-                              },
-                            );
-
-                            // If public Downloads failed, fallback to app-specific folder
-                            if (!result.success) {
-                              debugPrint(
-                                  '⚠️ Public Downloads failed, using app-specific folder...');
-                              result = await downloadService.downloadFile(
-                                url: url,
-                                contentDisposition: contentDisposition,
-                                context: context,
-                                usePublicDownloads:
-                                    false, // Use app-specific folder (no permission needed)
-                                onProgress: (received, total) {
-                                  if (total > 0) {
-                                    final progress = (received / total * 100)
-                                        .toStringAsFixed(1);
-                                    debugPrint(
-                                        '📥 Download progress: $progress%');
+                                  // Fallback: If offline and the page rendered completely blank (SPA failure)
+                                  if (!_isOnline) {
+                                    Future.delayed(const Duration(milliseconds: 800), () async {
+                                      if (mounted && _webViewController != null && !_isLoading) {
+                                        try {
+                                          final text = await _webViewController!.evaluateJavascript(
+                                            source: "document.body ? document.body.innerText.trim() : ''"
+                                          );
+                                          final html = await _webViewController!.evaluateJavascript(
+                                            source: "document.body ? document.body.innerHTML.trim() : ''"
+                                          );
+                                          
+                                          if ((text == null || text.toString().isEmpty) && 
+                                              (html == null || html.toString().length < 100)) {
+                                            debugPrint('⚠️ Detected blank screen while offline, forcing offline UI');
+                                            final canGoBack = await controller.canGoBack();
+                                            if (canGoBack) {
+                                              await controller.goBack();
+                                              _showOfflinePopup();
+                                            } else {
+                                              setState(() {
+                                                _pageLoadFailed = true;
+                                              });
+                                            }
+                                          }
+                                        } catch (e) {
+                                          debugPrint('Error checking for blank page: $e');
+                                        }
+                                      }
+                                    });
                                   }
                                 },
-                              );
-                            }
-                          } else {
-                            // Use app-specific folder (no permission needed for Android 10+)
-                            debugPrint(
-                                '📥 Downloading to app-specific Downloads folder (no permission needed)...');
-                            result = await downloadService.downloadFile(
-                              url: url,
-                              contentDisposition: contentDisposition,
-                              context: context,
-                              usePublicDownloads:
-                                  false, // Use app-specific folder
-                              onProgress: (received, total) {
-                                if (total > 0) {
-                                  final progress = (received / total * 100)
-                                      .toStringAsFixed(1);
+                                onProgressChanged: (controller, progress) {
+                                  if (progress == 100) {
+                                    _forceApplyStatusBarStyle();
+                                  }
+                                  setState(() {
+                                    _loadingProgress = progress / 100;
+                                    if (progress >= 100) {
+                                      _isLoading = false;
+                                      _isInitialLoad = false;
+                                    }
+                                  });
+                                  debugPrint('📊 Loading progress: $progress%');
+                                },
+                                onLoadError: (controller, url, code, message) async {
+                                  _pullToRefreshController.endRefreshing();
+                                  
+                                  final canGoBack = await controller.canGoBack();
+                                  
+                                  setState(() {
+                                    _isLoading = false;
+                                    _isInitialLoad = false;
+                                  });
+                                  
+                                  if (canGoBack) {
+                                    final currentUrl = await controller.getUrl();
+                                    if (currentUrl?.toString() == url?.toString()) {
+                                      await controller.goBack();
+                                    }
+                                    _showOfflinePopup();
+                                  } else {
+                                    setState(() {
+                                      _pageLoadFailed = true;
+                                    });
+                                  }
+                                  
+                                  debugPrint('❌ Load error: $message (code: $code)');
+                                },
+                                onGeolocationPermissionsShowPrompt:
+                                    (controller, origin) async {
+                                  return GeolocationPermissionShowPromptResponse(
+                                      origin: origin,
+                                      allow: true,
+                                      retain: true);
+                                },
+                                onPermissionRequest:
+                                    (controller, request) async {
                                   debugPrint(
-                                      '📥 Download progress: $progress%');
-                                }
-                              },
-                            );
-                          }
+                                      '🔒 Permission requested: ${request.resources}');
 
-                          if (!mounted) return;
+                                  final resources = request.resources;
+                                  if (resources.contains(
+                                      PermissionResourceType.CAMERA)) {
+                                    final status =
+                                        await Permission.camera.request();
+                                    if (!status.isGranted) {
+                                      return PermissionResponse(
+                                        resources: resources,
+                                        action: PermissionResponseAction.DENY,
+                                      );
+                                    }
+                                  }
 
-                          if (result.success && result.filePath != null) {
-                            // Show success message
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Row(
-                                      children: [
-                                        const Icon(Icons.check_circle,
-                                            color: Colors.white),
-                                        const SizedBox(width: 8),
-                                        Expanded(
-                                          child: Text(
-                                            isReceiptDownload
-                                                ? 'Receipt saved to Downloads'
-                                                : 'File saved to Downloads',
+                                  if (resources.contains(
+                                      PermissionResourceType.MICROPHONE)) {
+                                    final status =
+                                        await Permission.microphone.request();
+                                    if (!status.isGranted) {
+                                      return PermissionResponse(
+                                        resources: resources,
+                                        action: PermissionResponseAction.DENY,
+                                      );
+                                    }
+                                  }
+
+                                  return PermissionResponse(
+                                    resources: resources,
+                                    action: PermissionResponseAction.GRANT,
+                                  );
+                                },
+                                onConsoleMessage: (controller, consoleMessage) {
+                                  debugPrint(
+                                      '🌐 JS Console: ${consoleMessage.messageLevel}: ${consoleMessage.message}');
+                                },
+                                onDownloadStartRequest:
+                                    (controller, downloadStartRequest) async {
+                                  try {
+                                    final url =
+                                        downloadStartRequest.url.toString();
+                                    final suggestedFilename =
+                                        downloadStartRequest.suggestedFilename;
+                                    final mimeType =
+                                        downloadStartRequest.mimeType;
+                                    final contentDisposition =
+                                        downloadStartRequest.contentDisposition;
+
+                                    debugPrint('📥 Download requested: $url');
+                                    debugPrint(
+                                        '📄 Suggested filename: $suggestedFilename');
+                                    debugPrint('📋 MIME type: $mimeType');
+                                    debugPrint(
+                                        '📋 Content-Disposition: $contentDisposition');
+
+                                    // Handle blob URLs - they need to be extracted via JavaScript
+                                    if (url.startsWith('blob:')) {
+                                      debugPrint(
+                                          '🔵 Blob URL detected, extracting blob data...');
+                                      await _handleBlobDownload(
+                                        controller: controller,
+                                        blobUrl: url,
+                                        suggestedFilename:
+                                            suggestedFilename ?? 'receipt.pdf',
+                                        mimeType: mimeType ?? 'application/pdf',
+                                        isReceiptDownload: true,
+                                      );
+                                      return;
+                                    }
+
+                                    // Check if it's a receipt download
+                                    final isReceiptDownload =
+                                        url.contains('receipt') ||
+                                            url.contains('download-receipt') ||
+                                            url.contains('invoice') ||
+                                            (suggestedFilename != null &&
+                                                (suggestedFilename
+                                                        .toLowerCase()
+                                                        .contains('receipt') ||
+                                                    suggestedFilename
+                                                        .toLowerCase()
+                                                        .contains('invoice')));
+
+                                    if (!mounted) return;
+
+                                    // For Android 10+, app-specific directories don't require permission
+                                    // Only request permission if we need public Downloads folder
+                                    // But we'll try public Downloads first, fallback to app-specific if needed
+                                    bool hasPermission = false;
+                                    bool canDownload = true;
+
+                                    if (isReceiptDownload) {
+                                      // For receipts, try to get permission for public Downloads
+                                      hasPermission =
+                                          await PermissionHandlerUtil
+                                              .checkStoragePermission();
+                                      if (!hasPermission) {
+                                        final granted =
+                                            await PermissionHandlerUtil
+                                                .requestStoragePermission();
+                                        if (!granted) {
+                                          // Permission denied, but we can still download to app-specific folder
+                                          debugPrint(
+                                              '⚠️ Permission denied, will use app-specific Downloads folder');
+                                          hasPermission = false;
+                                          canDownload =
+                                              true; // Still allow download to app folder
+                                        } else {
+                                          hasPermission = true;
+                                        }
+                                      } else {
+                                        hasPermission = true;
+                                      }
+                                    } else {
+                                      // For other files, app-specific directory doesn't need permission
+                                      canDownload = true;
+                                    }
+
+                                    if (!canDownload) {
+                                      if (mounted) {
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(
+                                          const SnackBar(
+                                            content: Text(
+                                                'Cannot download file. Please check storage permissions in app settings.'),
+                                            backgroundColor: Colors.orange,
+                                            duration: Duration(seconds: 3),
+                                          ),
+                                        );
+                                      }
+                                      return;
+                                    }
+
+                                    // Show download progress
+                                    if (mounted) {
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                        SnackBar(
+                                          content: Row(
+                                            children: [
+                                              const SizedBox(
+                                                width: 20,
+                                                height: 20,
+                                                child:
+                                                    CircularProgressIndicator(
+                                                  strokeWidth: 2,
+                                                  valueColor:
+                                                      AlwaysStoppedAnimation<
+                                                          Color>(Colors.white),
+                                                ),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Expanded(
+                                                child: Text(
+                                                  isReceiptDownload
+                                                      ? 'Downloading receipt...'
+                                                      : 'Downloading file...',
+                                                  style: const TextStyle(
+                                                      color: Colors.white),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          backgroundColor: Colors.blue,
+                                          duration: const Duration(seconds: 2),
+                                        ),
+                                      );
+                                    }
+
+                                    // Download the file
+                                    // For Android 10+, app-specific directories don't require permission
+                                    // Try public Downloads for receipts if permission granted, otherwise use app-specific
+                                    final downloadService = DownloadService();
+                                    DownloadResult result;
+
+                                    if (isReceiptDownload && hasPermission) {
+                                      // Try public Downloads folder first
+                                      debugPrint(
+                                          '📥 Attempting to download receipt to public Downloads folder...');
+                                      result =
+                                          await downloadService.downloadFile(
+                                        url: url,
+                                        contentDisposition: contentDisposition,
+                                        context: context,
+                                        usePublicDownloads:
+                                            true, // Try public Downloads
+                                        onProgress: (received, total) {
+                                          if (total > 0) {
+                                            final progress =
+                                                (received / total * 100)
+                                                    .toStringAsFixed(1);
+                                            debugPrint(
+                                                '📥 Download progress: $progress%');
+                                          }
+                                        },
+                                      );
+
+                                      // If public Downloads failed, fallback to app-specific folder
+                                      if (!result.success) {
+                                        debugPrint(
+                                            '⚠️ Public Downloads failed, using app-specific folder...');
+                                        result =
+                                            await downloadService.downloadFile(
+                                          url: url,
+                                          contentDisposition:
+                                              contentDisposition,
+                                          context: context,
+                                          usePublicDownloads:
+                                              false, // Use app-specific folder (no permission needed)
+                                          onProgress: (received, total) {
+                                            if (total > 0) {
+                                              final progress =
+                                                  (received / total * 100)
+                                                      .toStringAsFixed(1);
+                                              debugPrint(
+                                                  '📥 Download progress: $progress%');
+                                            }
+                                          },
+                                        );
+                                      }
+                                    } else {
+                                      // Use app-specific folder (no permission needed for Android 10+)
+                                      debugPrint(
+                                          '📥 Downloading to app-specific Downloads folder (no permission needed)...');
+                                      result =
+                                          await downloadService.downloadFile(
+                                        url: url,
+                                        contentDisposition: contentDisposition,
+                                        context: context,
+                                        usePublicDownloads:
+                                            false, // Use app-specific folder
+                                        onProgress: (received, total) {
+                                          if (total > 0) {
+                                            final progress =
+                                                (received / total * 100)
+                                                    .toStringAsFixed(1);
+                                            debugPrint(
+                                                '📥 Download progress: $progress%');
+                                          }
+                                        },
+                                      );
+                                    }
+
+                                    if (!mounted) return;
+
+                                    if (result.success &&
+                                        result.filePath != null) {
+                                      // Show success message
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                        SnackBar(
+                                          content: Column(
+                                            mainAxisSize: MainAxisSize.min,
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Row(
+                                                children: [
+                                                  const Icon(Icons.check_circle,
+                                                      color: Colors.white),
+                                                  const SizedBox(width: 8),
+                                                  Expanded(
+                                                    child: Text(
+                                                      isReceiptDownload
+                                                          ? 'Receipt saved to Downloads'
+                                                          : 'File saved to Downloads',
+                                                      style: const TextStyle(
+                                                        color: Colors.white,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              if (result.filename != null) ...[
+                                                const SizedBox(height: 4),
+                                                Text(
+                                                  result.filename!,
+                                                  style: const TextStyle(
+                                                    color: Colors.white70,
+                                                    fontSize: 12,
+                                                  ),
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                          backgroundColor: Colors.green,
+                                          duration: const Duration(seconds: 4),
+                                          behavior: SnackBarBehavior.floating,
+                                          action: SnackBarAction(
+                                            label: 'OPEN',
+                                            textColor: Colors.white,
+                                            onPressed: () async {
+                                              if (result.filePath != null) {
+                                                await downloadService
+                                                    .openFile(result.filePath!);
+                                              }
+                                            },
+                                          ),
+                                        ),
+                                      );
+                                      debugPrint(
+                                          '✅ Download successful: ${result.filePath}');
+                                    } else {
+                                      // Show error message
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            result.error ?? 'Download failed',
                                             style: const TextStyle(
-                                              color: Colors.white,
-                                              fontWeight: FontWeight.bold,
-                                            ),
+                                                color: Colors.white),
+                                          ),
+                                          backgroundColor: Colors.red,
+                                          duration: const Duration(seconds: 3),
+                                        ),
+                                      );
+                                      debugPrint(
+                                          '❌ Download failed: ${result.error}');
+                                    }
+                                  } catch (e) {
+                                    debugPrint('❌ Error handling download: $e');
+                                    if (mounted) {
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                        SnackBar(
+                                          content: Text('Download failed: $e'),
+                                          backgroundColor: Colors.red,
+                                          duration: const Duration(seconds: 3),
+                                        ),
+                                      );
+                                    }
+                                  }
+                                },
+                              ),
+                                // Loading indicator overlay - only show when loading
+                                if (!shouldBlockWebViewCreation &&
+                                    _isLoading &&
+                                    !_pageLoadFailed &&
+                                    !(_isInitialLoad ||
+                                        !_splashMinDurationElapsed))
+                                Container(
+                                  color: Colors.white.withOpacity(0.9),
+                                  child: Center(
+                                    child: Column(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        CircularProgressIndicator(
+                                          value: _loadingProgress < 1.0 &&
+                                                  _loadingProgress > 0
+                                              ? _loadingProgress
+                                              : null,
+                                          valueColor:
+                                              AlwaysStoppedAnimation<Color>(
+                                                  AppConfig.primaryColor),
+                                        ),
+                                        const SizedBox(height: 16),
+                                        Text(
+                                          'Loading...',
+                                          style: TextStyle(
+                                            fontSize: 16,
+                                            color: AppConfig.primaryColor,
+                                            fontWeight: FontWeight.w500,
                                           ),
                                         ),
                                       ],
                                     ),
-                                    if (result.filename != null) ...[
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        result.filename!,
-                                        style: const TextStyle(
-                                          color: Colors.white70,
-                                          fontSize: 12,
-                                        ),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ],
-                                  ],
+                                  ),
                                 ),
-                                backgroundColor: Colors.green,
-                                duration: const Duration(seconds: 4),
-                                behavior: SnackBarBehavior.floating,
-                                action: SnackBarAction(
-                                  label: 'OPEN',
-                                  textColor: Colors.white,
-                                  onPressed: () async {
-                                    if (result.filePath != null) {
-                                      await downloadService
-                                          .openFile(result.filePath!);
-                                    }
-                                  },
-                                ),
-                              ),
-                            );
-                            debugPrint(
-                                '✅ Download successful: ${result.filePath}');
-                          } else {
-                            // Show error message
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text(
-                                  result.error ?? 'Download failed',
-                                  style: const TextStyle(color: Colors.white),
-                                ),
-                                backgroundColor: Colors.red,
-                                duration: const Duration(seconds: 3),
-                              ),
-                            );
-                            debugPrint('❌ Download failed: ${result.error}');
-                          }
-                        } catch (e) {
-                          debugPrint('❌ Error handling download: $e');
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('Download failed: $e'),
-                                backgroundColor: Colors.red,
-                                duration: const Duration(seconds: 3),
-                              ),
-                            );
-                          }
-                        }
-                      },
-                    ),
-                    // Loading indicator overlay - only show when loading
-                    if (_isLoading && !(_isInitialLoad || !_splashMinDurationElapsed))
-                      Container(
-                        color: Colors.white.withOpacity(0.9),
-                        child: Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              CircularProgressIndicator(
-                                value: _loadingProgress < 1.0 &&
-                                        _loadingProgress > 0
-                                    ? _loadingProgress
-                                    : null,
-                                valueColor: AlwaysStoppedAnimation<Color>(
-                                    AppConfig.primaryColor),
-                              ),
-                              const SizedBox(height: 16),
-                              Text(
-                                'Loading...',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  color: AppConfig.primaryColor,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
                             ],
                           ),
-                        ),
-                      ),
-                  ],
-                )
-              : OfflineScreen(
-                  onRetry: _retryLoad),
-              ), // closes Expanded
-            ],  // closes Column children list
-          ),    // closes Column
-          // ── Splash Screen (Full Screen Overlay) ───────────
-          if (_isInitialLoad || !_splashMinDurationElapsed)
-            const Positioned.fill(
-              child: SplashScreen(),
+                  ), // closes Expanded
+                ], // closes Column children list
+              ), // closes Column
+              // ── Splash Screen (Full Screen Overlay) ───────────
+              if (_isInitialLoad || !_splashMinDurationElapsed)
+                const Positioned.fill(
+                  child: SplashScreen(),
+                ),
+            ], // closes Stack children
+          ), // closes Stack (Scaffold body)
+        ), // closes Scaffold
+      ), // closes WillPopScope
+    ); // closes AnnotatedRegion return
+  }
+
+  Widget _buildOfflineUI() {
+    return Positioned.fill(
+      child: Container(
+        color: Colors.white,
+        width: double.infinity,
+        height: double.infinity,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.wifi_off_rounded,
+              size: 80,
+              color: Colors.grey[400],
             ),
-        ], // closes Stack children
-      ),   // closes Stack (Scaffold body)
-    ),     // closes Scaffold
-      ),        // closes WillPopScope
-    );          // closes AnnotatedRegion return
+            const SizedBox(height: 20),
+            const Text(
+              'No Internet Connection',
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.bold,
+                color: Colors.black87,
+              ),
+            ),
+            const SizedBox(height: 10),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 40),
+              child: Text(
+                'Please turn on your internet connection to load this page.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Colors.black54,
+                ),
+              ),
+            ),
+            const SizedBox(height: 30),
+            ElevatedButton.icon(
+              onPressed: () {
+                setState(() {
+                  _pageLoadFailed = false;
+                  _isLoading = true;
+                });
+                _retryLoad();
+              },
+              icon: const Icon(Icons.refresh, color: Colors.white),
+              label: const Text('Try Again', style: TextStyle(color: Colors.white)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppConfig.primaryColor,
+                padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(30),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showOfflinePopup() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).removeCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: const [
+            Icon(Icons.wifi_off, color: Colors.white),
+            SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                "No internet connection. Please check your internet and try again.",
+                style: TextStyle(color: Colors.white),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: const Color(0xFF8E4692),
+        duration: const Duration(seconds: 4),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
+      ),
+    );
   }
 
   Widget _buildSourceOption({
