@@ -95,7 +95,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                   child: Container(
                     width: 480,  
                     height: 480, 
-                    color: const Color(0xFF087B84),
+                    color: Colors.white,
                   ),
                 ),
               );
@@ -110,8 +110,8 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                 opacity: _logoOpacity.value,
                 child: Center(
                   child: SizedBox(
-                    width: 170, 
-                    height: 170,
+                    width: 270, 
+                    height: 270,
                     child: Image.asset(
                       AppConfig.appLogoPath,
                       fit: BoxFit.contain,

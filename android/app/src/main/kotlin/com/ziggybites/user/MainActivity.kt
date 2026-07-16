@@ -1,4 +1,4 @@
-package com.buytogether.app
+package com.appzeto.createbharat
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -13,7 +13,7 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.mobasket.user/geolocation"
-    private val STATUS_BAR_CHANNEL = "com.buytogether.app/statusbar"
+    private val STATUS_BAR_CHANNEL = "com.appzeto.createbharat/statusbar"
     private val LOCATION_PERMISSION_REQUEST_CODE = 1
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {

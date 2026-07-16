@@ -1,22 +1,21 @@
 {
   "project_info": {
-    "project_number": "694115785084",
-    "firebase_url": "https://but-together-default-rtdb.firebaseio.com",
-    "project_id": "but-together",
-    "storage_bucket": "but-together.firebasestorage.app"
+    "project_number": "901085016313",
+    "project_id": "rentyatra-1e42a",
+    "storage_bucket": "rentyatra-1e42a.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:694115785084:android:ef949032f30607943eacf9",
+        "mobilesdk_app_id": "1:901085016313:android:c9ec581a9bf5a4df94f228",
         "android_client_info": {
-          "package_name": "com.buytogether.app"
+          "package_name": "com.appzeto.createbharat"
         }
       },
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyDVL0NhTf7P1_G0PyuOg5PhPQaEuVBvCKo"
+          "current_key": "AIzaSyCuTTygPHzS9-UOs_1T6_IDkCHRvPi5QBU"
         }
       ],
       "services": {
